@@ -9,10 +9,10 @@ using DorkDl.CriInterop;
 
 namespace DorkDl.Cli;
 
-// Written for System.CommandLine 3.0-preview.7 (uses SetAction, Options.Add, and Parse(args).InvokeAsync instead of 2.0 beta patterns).
+// Targets System.CommandLine 3.0-preview.7 (SetAction, Options.Add, and Parse(args).InvokeAsync).
 public static class Program
 {
-    // Stashed here so ResolveSourceAsync can grab it without plumbing it through every subcommand.
+    // Stashed here so ResolveSourceAsync can read it without plumbing it through every subcommand.
     private static Option<string?>? LauncherUrlOption;
 
     public static async Task<int> Main(string[] args)
@@ -20,7 +20,7 @@ public static class Program
         var gameDirOption = new Option<string>("--game-dir")
         {
             Description = "Path to the installed game, either its root directory or its data directory",
-            // Needs to be recursive or subcommands crash when reading it. Not required since catalog/download/extras can run off CDN alone.
+            // Recursive is needed so subcommands see it. Not required since catalog/download/extras can run off CDN.
             Recursive = true,
         };
 
@@ -52,6 +52,7 @@ public static class Program
         root.Subcommands.Add(BuildExtrasCommand(gameDirOption, cacheOption));
         root.Subcommands.Add(BuildGffCommand(gameDirOption));
         root.Subcommands.Add(BuildNamesCommand(gameDirOption));
+        root.Subcommands.Add(BuildPacksCommand(gameDirOption));
 
         return await root.Parse(args).InvokeAsync();
     }
@@ -149,8 +150,14 @@ public static class Program
             Description = "Bundle file name, with or without the .bundle suffix, or a full path",
         };
 
+        var hashesOption = new Option<bool>("--hashes")
+        {
+            Description = "Also print each archive's plain MD5, which is what the catalog calls the bundle's hash",
+        };
+
         var command = new Command("inspect", "Show the archives, block tables and file lists of one bundle.");
         command.Arguments.Add(bundleArgument);
+        command.Options.Add(hashesOption);
 
         command.SetAction(parse =>
         {
@@ -163,6 +170,9 @@ public static class Program
             }
 
             var bundle = BundleReader.Read(path);
+            var hashes = parse.GetValue(hashesOption)
+                ? BundleExtractor.ComputeArchivePlainHashes(path, bundle)
+                : null;
 
             Console.WriteLine(bundle.FileName);
             Console.WriteLine($"  on disk      {FormatSize(bundle.FileSize)}");
@@ -181,6 +191,11 @@ public static class Program
                 Console.WriteLine();
                 Console.WriteLine($"  archive {index} at offset {archive.ArchiveOffset}, {FormatSize(archive.ArchiveSize)}");
                 Console.WriteLine($"    key        mask {archive.Mask:x8}{(archive.Inverted ? ", inverted" : "")}");
+                if (hashes is not null)
+                {
+                    Console.WriteLine($"    plain md5  {Convert.ToHexString(hashes[index]).ToLowerInvariant()}");
+                }
+
                 Console.WriteLine($"    unity      {header.UnityRevision} (format {header.FormatVersion}, {header.UnityVersion})");
                 Console.WriteLine($"    flags      0x{header.Flags:x}, block table {header.BlocksInfoCompression}"
                                   + (header.BlocksInfoAtEnd ? ", stored at end" : ""));
@@ -223,6 +238,13 @@ public static class Program
             Description = "Show each key's locations, with resource type and provider",
         };
 
+        var typeOption = TypeOption();
+
+        var depsOption = new Option<bool>("--deps")
+        {
+            Description = "Show the bundles each key's locations load from",
+        };
+
         var limitOption = new Option<int>("--limit")
         {
             Description = "Stop after this many matches; 0 means no limit",
@@ -239,6 +261,8 @@ public static class Program
         command.Options.Add(bundlesOption);
         command.Options.Add(statsOption);
         command.Options.Add(locationsOption);
+        command.Options.Add(typeOption);
+        command.Options.Add(depsOption);
         command.Options.Add(limitOption);
         command.Options.Add(baseUrlOption);
 
@@ -254,6 +278,8 @@ public static class Program
             var limit = parse.GetValue(limitOption);
             var showBundles = parse.GetValue(bundlesOption);
             var showLocations = parse.GetValue(locationsOption);
+            var showDeps = parse.GetValue(depsOption);
+            var type = parse.GetValue(typeOption);
 
             Console.Error.WriteLine($"{Path.GetFileName(path)}: {catalog.LocatorId}, {catalog.KeyCount} keys");
 
@@ -277,6 +303,11 @@ public static class Program
                     continue;
                 }
 
+                if (type is not null && !catalog.Locations(key).Any(l => MatchesType(l, type)))
+                {
+                    continue;
+                }
+
                 if (showBundles)
                 {
                     var options = catalog.Locations(key).Select(l => l.BundleOptions).FirstOrDefault(o => o is not null);
@@ -289,11 +320,22 @@ public static class Program
                     Console.WriteLine(key.Name);
                 }
 
-                if (showLocations)
+                if (showLocations || showDeps)
                 {
                     foreach (var location in catalog.Locations(key))
                     {
-                        Console.WriteLine($"    {location.ResourceType ?? "?"}  id={location.InternalId}");
+                        if (showLocations)
+                        {
+                            Console.WriteLine($"    {location.ResourceType ?? "?"}  id={location.InternalId}");
+                        }
+
+                        if (showDeps)
+                        {
+                            foreach (var bundle in catalog.BundlesFor(location).Distinct())
+                            {
+                                Console.WriteLine($"      in {bundle}");
+                            }
+                        }
                     }
                 }
 
@@ -429,7 +471,7 @@ public static class Program
                         }
                         catch (IOException)
                         {
-                            // Don't fail the whole run just because a temp file wouldn't delete.
+                            // Leaving a temp stream behind is not worth failing the run over.
                         }
                     }
                 }
@@ -454,6 +496,107 @@ public static class Program
             Console.Error.WriteLine($"bytes    {FormatSize(bytes)}");
             Console.Error.WriteLine($"failures {failures}");
             return failures == 0 ? 0 : 1;
+        });
+
+        return command;
+    }
+
+    private static Option<string> PacksOption() => new("--packs")
+    {
+        Description = "Where the pack index lives; built on first use",
+        DefaultValueFactory = _ => Path.Combine("output", "pack-index.json"),
+    };
+
+    // Loads pack index, building it on first use (hashes all pack sub-archives against GFF index).
+    private static IReadOnlyDictionary<string, PackedBundle> LoadOrBuildPacks(
+        GameInstall install, string indexPath, int concurrency, bool rebuild, CancellationToken cancellationToken)
+    {
+        if (rebuild || !File.Exists(indexPath))
+        {
+            var gffPath = install.FindGffIndex()
+                ?? throw new FileNotFoundException($"No GFF container found in {install.BundleDirectory}");
+
+            Console.Error.WriteLine($"building {indexPath} from {install.BundleDirectory}");
+            var report = PackIndex.Build(
+                install, GffContainer.Load(gffPath), indexPath, concurrency,
+                new SynchronousProgress(Console.Error.WriteLine), cancellationToken);
+
+            Console.Error.WriteLine($"files    {report.Files}");
+            Console.Error.WriteLine($"packs    {report.Packs}, holding {report.Archives} archives");
+            Console.Error.WriteLine($"resolved {report.Resolved} catalog bundles");
+            Console.Error.WriteLine($"failures {report.Failures}");
+            Console.Error.WriteLine();
+        }
+
+        return PackIndex.Load(indexPath);
+    }
+
+    private static Command BuildPacksCommand(Option<string> gameDirOption)
+    {
+        var filtersArgument = new Argument<string[]>("filters")
+        {
+            Description = "Case-insensitive substring filters on the catalog bundle name or the file holding it, AND-combined",
+            Arity = ArgumentArity.ZeroOrMore,
+        };
+
+        var packsOption = PacksOption();
+
+        var rebuildOption = new Option<bool>("--rebuild")
+        {
+            Description = "Rebuild the index even if it already exists",
+        };
+
+        var limitOption = new Option<int>("--limit")
+        {
+            Description = "Stop after this many matches; 0 means no limit",
+            DefaultValueFactory = _ => 50,
+        };
+
+        var concurrencyOption = new Option<int>("--concurrency")
+        {
+            Description = "Files to hash in parallel while building",
+            DefaultValueFactory = _ => BundleExtraction.DefaultConcurrency,
+        };
+
+        var command = new Command("packs", "Resolve catalog bundle names to the installed files that hold them.");
+        command.Arguments.Add(filtersArgument);
+        command.Options.Add(packsOption);
+        command.Options.Add(rebuildOption);
+        command.Options.Add(limitOption);
+        command.Options.Add(concurrencyOption);
+
+        command.SetAction((parse, cancellationToken) =>
+        {
+            var install = RequireInstall(parse, gameDirOption);
+            var packs = LoadOrBuildPacks(
+                install, parse.GetValue(packsOption)!, parse.GetValue(concurrencyOption),
+                parse.GetValue(rebuildOption), cancellationToken);
+
+            var filters = parse.GetValue(filtersArgument) ?? [];
+            var limit = parse.GetValue(limitOption);
+            var shown = 0;
+
+            foreach (var entry in packs.Values.OrderBy(e => e.Name, StringComparer.Ordinal))
+            {
+                if (filters.Length > 0 && !filters.All(f =>
+                        entry.Name.Contains(f, StringComparison.OrdinalIgnoreCase)
+                        || entry.File.Contains(f, StringComparison.OrdinalIgnoreCase)))
+                {
+                    continue;
+                }
+
+                Console.WriteLine(entry.File == entry.Name
+                    ? $"{entry.Name}  own file, {FormatSize(entry.Size)}"
+                    : $"{entry.Name}  in {entry.File}#{entry.Archive} at {entry.Offset}, {FormatSize(entry.Size)}");
+
+                if (limit > 0 && ++shown >= limit)
+                {
+                    Console.Error.WriteLine($"stopped at --limit {limit}");
+                    break;
+                }
+            }
+
+            return Task.FromResult(0);
         });
 
         return command;
@@ -501,6 +644,9 @@ public static class Program
             DefaultValueFactory = _ => 0,
         };
 
+        var memoryOption = MemoryOption();
+        var packsOption = PacksOption();
+
         var command = new Command("names", "Resolve asset GUIDs to the names the bundles give them.");
         command.Arguments.Add(filtersArgument);
         command.Options.Add(indexOption);
@@ -509,16 +655,38 @@ public static class Program
         command.Options.Add(limitOption);
         command.Options.Add(concurrencyOption);
         command.Options.Add(bundlesOption);
+        command.Options.Add(memoryOption);
+        command.Options.Add(packsOption);
 
         command.SetAction((parse, cancellationToken) =>
         {
             var install = RequireInstall(parse, gameDirOption);
             var index = parse.GetValue(indexOption)!;
+            var rebuild = parse.GetValue(rebuildOption);
 
-            if (parse.GetValue(rebuildOption) || !File.Exists(index))
+            // --rebuild means from nothing; otherwise a run picks up where a killed one stopped.
+            if (rebuild)
             {
+                File.Delete(AssetNameIndex.ProgressPathFor(index));
+            }
+
+            if (rebuild || !File.Exists(index))
+            {
+                // The GFF index sits in the bundle directory with a .bundle name, and is not one.
+                var gff = install.FindGffIndex();
+                var sources = install.EnumerateBundles().Where(p => p != gff);
                 var take = parse.GetValue(bundlesOption);
-                var sources = take > 0 ? install.EnumerateBundles().Take(take) : install.EnumerateBundles();
+                if (take > 0)
+                {
+                    sources = sources.Take(take);
+                }
+
+                // With pack index, record entries under catalog bundle names instead of "<pack>#<i>".
+                var packs = LoadOrBuildPacks(
+                    install, parse.GetValue(packsOption)!, parse.GetValue(concurrencyOption), rebuild: false, cancellationToken);
+                var byArchive = packs.Values.ToDictionary(e => (e.File, e.Archive), e => e.Name);
+                string NameArchive(string file, int archive) =>
+                    byArchive.TryGetValue((file, archive), out var name) ? name : archive == 0 ? file : $"{file}#{archive}";
 
                 Console.Error.WriteLine($"building {index} from {install.BundleDirectory}");
                 var log = new SynchronousProgress(Console.Error.WriteLine);
@@ -526,11 +694,18 @@ public static class Program
                     sources,
                     index,
                     parse.GetValue(concurrencyOption),
+                    MemoryLimitBytes(parse, memoryOption),
                     log,
+                    NameArchive,
                     cancellationToken);
 
                 Console.Error.WriteLine();
                 Console.Error.WriteLine($"bundles  {report.Bundles}");
+                if (report.Skipped > 0)
+                {
+                    Console.Error.WriteLine($"resumed  {report.Skipped}");
+                }
+
                 Console.Error.WriteLine($"guids    {report.Guids}");
                 Console.Error.WriteLine($"assets   {report.Assets}");
                 Console.Error.WriteLine($"failures {report.Failures}");
@@ -600,8 +775,14 @@ public static class Program
             DefaultValueFactory = _ => BundleExtraction.DefaultConcurrency,
         };
 
+        var fileOption = new Option<string?>("--file")
+        {
+            Description = "A GFF container to read instead of the install's bundle index",
+        };
+
         var command = new Command("gff", "Read the GFF bundle index and check it against the install.");
         command.Arguments.Add(filtersArgument);
+        command.Options.Add(fileOption);
         command.Options.Add(verifyOption);
         command.Options.Add(limitOption);
         command.Options.Add(concurrencyOption);
@@ -609,7 +790,7 @@ public static class Program
         command.SetAction((parse, cancellationToken) =>
         {
             var install = RequireInstall(parse, gameDirOption);
-            var path = install.FindGffIndex();
+            var path = parse.GetValue(fileOption) ?? install.FindGffIndex();
             if (path is null)
             {
                 Console.Error.WriteLine($"No GFF container found in {install.BundleDirectory}");
@@ -973,7 +1154,7 @@ public static class Program
     {
         var filtersArgument = new Argument<string[]>("filters")
         {
-            Description = "Case-insensitive substring filters on the bundle name, AND-combined",
+            Description = "Case-insensitive substring filters on the file name or the catalog bundle name, AND-combined",
             Arity = ArgumentArity.ZeroOrMore,
         };
 
@@ -982,6 +1163,9 @@ public static class Program
             Description = "Directory to write extracted files into",
             DefaultValueFactory = _ => "output",
         };
+
+        var typeOption = TypeOption();
+        var packsOption = PacksOption();
 
         var limitOption = new Option<int>("--limit")
         {
@@ -1012,8 +1196,10 @@ public static class Program
 
         var kindsOption = new Option<string?>("--kinds")
         {
-            Description = "Comma-separated asset kinds to write: Texture2D, Sprite, TextAsset",
+            Description = "Comma-separated asset kinds to write: Texture2D, Sprite, TextAsset, MonoBehaviour",
         };
+
+        var memoryOption = MemoryOption();
 
         var command = new Command("extract", "Decompress bundles and convert the assets inside them.");
         command.Arguments.Add(filtersArgument);
@@ -1024,6 +1210,9 @@ public static class Program
         command.Options.Add(keepRawOption);
         command.Options.Add(concurrencyOption);
         command.Options.Add(kindsOption);
+        command.Options.Add(memoryOption);
+        command.Options.Add(typeOption);
+        command.Options.Add(packsOption);
 
         command.SetAction((parse, cancellationToken) =>
         {
@@ -1045,19 +1234,19 @@ public static class Program
                 Verify: verify,
                 Raw: raw,
                 KeepRaw: parse.GetValue(keepRawOption),
-                Kinds: kinds);
+                Kinds: kinds,
+                MemoryLimit: MemoryLimitBytes(parse, memoryOption));
 
-            var paths = install.EnumerateBundles()
-                .Where(p => filters.Length == 0
-                            || filters.All(f => Path.GetFileName(p)
-                                .Contains(f, StringComparison.OrdinalIgnoreCase)));
+            var targets = SelectExtractTargets(
+                install, filters, parse.GetValue(typeOption), parse.GetValue(packsOption)!,
+                options.Concurrency, cancellationToken);
 
-            Console.Error.WriteLine($"unpacking with {options.Concurrency} workers");
+            var budget = options.MemoryLimit > 0 ? options.MemoryLimit : MemoryBudget.DefaultLimit;
+            Console.Error.WriteLine($"unpacking with {options.Concurrency} workers, {FormatSize(budget)} of payload in flight");
 
-            // Avoid Progress<T> here: it bounces to the thread pool and lines land after the summary.
-            // Console.Error is synchronized per-line anyway, so worker output won't tear.
+            // Avoid Progress<T> here: it bounces to threadpool so lines land after summary. Console.Error writes whole lines without tearing.
             var log = new SynchronousProgress(Console.Error.WriteLine);
-            var progress = BundleExtraction.Run(paths, options, log, cancellationToken);
+            var progress = BundleExtraction.Run(targets, options, log, cancellationToken);
 
             Console.Error.WriteLine();
             Console.Error.WriteLine($"bundles  {progress.Bundles}");
@@ -1125,8 +1314,11 @@ public static class Program
             Description = $"CDN base URL (default: {CdnSource.DefaultBaseUrl})",
         };
 
+        var typeOption = TypeOption();
+
         var command = new Command("download", "Mirror bundles from the CDN.");
         command.Arguments.Add(filtersArgument);
+        command.Options.Add(typeOption);
         command.Options.Add(outputOption);
         command.Options.Add(concurrencyOption);
         command.Options.Add(limitOption);
@@ -1159,8 +1351,17 @@ public static class Program
                 Overwrite: parse.GetValue(overwriteOption),
                 Limit: parse.GetValue(limitOption));
 
+            // --type filters by asset resource type (since bundle and asset keys are hashes).
+            var type = parse.GetValue(typeOption);
+            var wanted = type is null ? null : BundlesHoldingType(catalog, type);
+            if (wanted is not null)
+            {
+                Console.Error.WriteLine($"{wanted.Count} bundles hold assets of type *{type}*");
+            }
+
             var requests = catalog.Keys()
                 .Where(k => k.IsBundleKey)
+                .Where(k => wanted is null || wanted.Contains(k.Name))
                 .Where(k => filters.Length == 0
                             || filters.All(f => k.Name.Contains(f, StringComparison.OrdinalIgnoreCase)))
                 .Select(k => new BundleRequest(
@@ -1192,6 +1393,101 @@ public static class Program
         });
 
         return command;
+    }
+
+    // Determines extraction targets: whole bundles or individual pack sub-archives (filtered by filename or --type).
+    private static IEnumerable<ExtractTarget> SelectExtractTargets(
+        GameInstall install,
+        string[] filters,
+        string? type,
+        string packsPath,
+        int concurrency,
+        CancellationToken cancellationToken)
+    {
+        bool Matches(string name) =>
+            filters.Length == 0 || filters.All(f => name.Contains(f, StringComparison.OrdinalIgnoreCase));
+
+        if (type is null)
+        {
+            var byFile = install.EnumerateBundles()
+                .Where(p => Matches(Path.GetFileName(p)))
+                .Select(ExtractTarget.WholeFile)
+                .ToList();
+
+            // A filter that matched nothing on disk may be a catalog name inside a pack.
+            if (byFile.Count > 0 || filters.Length == 0 || !File.Exists(packsPath))
+            {
+                return byFile;
+            }
+
+            var packs = PackIndex.Load(packsPath);
+            return packs.Values
+                .Where(e => e.File != e.Name && Matches(e.Name))
+                .Select(e => new ExtractTarget(
+                    Path.Combine(install.BundleDirectory, e.File), Path.GetFileNameWithoutExtension(e.Name), e.Archive))
+                .ToList();
+        }
+
+        var catalogPath = install.FindCatalog()
+            ?? throw new FileNotFoundException($"No catalog_main_*.bin in {install.BundleDirectory}");
+        var wanted = BundlesHoldingType(ContentCatalog.Load(catalogPath), type);
+        Console.Error.WriteLine($"{wanted.Count} catalog bundles hold assets of type *{type}*");
+
+        var index = LoadOrBuildPacks(install, packsPath, concurrency, rebuild: false, cancellationToken);
+        var targets = new List<ExtractTarget>();
+        var missing = 0;
+        foreach (var name in wanted.Where(Matches).Order(StringComparer.Ordinal))
+        {
+            if (index.TryGetValue(name, out var entry))
+            {
+                targets.Add(new ExtractTarget(
+                    Path.Combine(install.BundleDirectory, entry.File),
+                    Path.GetFileNameWithoutExtension(entry.Name),
+                    entry.File == entry.Name ? null : entry.Archive));
+            }
+            else
+            {
+                missing++;
+            }
+        }
+
+        if (missing > 0)
+        {
+            Console.Error.WriteLine($"{missing} of them are not installed");
+        }
+
+        return targets;
+    }
+
+    private static Option<string?> TypeOption() => new("--type")
+    {
+        Description = "Only keys with a location of this resource type, by case-insensitive substring: AdvImportBook, Texture2D",
+    };
+
+    private static bool MatchesType(CatalogLocation location, string type) =>
+        location.ResourceType?.Contains(type, StringComparison.OrdinalIgnoreCase) == true;
+
+    // Returns bundle names providing assets of the specified resource type.
+    private static HashSet<string> BundlesHoldingType(ContentCatalog catalog, string type)
+    {
+        var bundles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var key in catalog.Keys())
+        {
+            if (key.IsBundleKey)
+            {
+                continue;
+            }
+
+            foreach (var location in catalog.Locations(key))
+            {
+                if (MatchesType(location, type))
+                {
+                    bundles.UnionWith(catalog.BundlesFor(location));
+                }
+            }
+        }
+
+        return bundles;
     }
 
     // Dumps catalog stats. Skips "on disk" when running off CDN rather than showing a bogus zero.
@@ -1325,7 +1621,17 @@ public static class Program
             cancellationToken);
     }
 
-    // Fires progress synchronously on the calling thread.
+    // In-flight payload budget in MiB (0 defaults to 1/4 available RAM).
+    private static Option<int> MemoryOption() => new("--memory")
+    {
+        Description = $"Payload bytes to hold in memory at once, in MiB (default: {MemoryBudget.DefaultLimit >> 20})",
+        DefaultValueFactory = _ => 0,
+    };
+
+    private static long MemoryLimitBytes(ParseResult parse, Option<int> option) =>
+        Math.Max(0, parse.GetValue(option)) << 20;
+
+    // Fires progress synchronously on calling thread.
     private sealed class SynchronousProgress(Action<string> report) : IProgress<string>
     {
         public void Report(string value) => report(value);

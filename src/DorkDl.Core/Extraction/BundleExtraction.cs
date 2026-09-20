@@ -11,7 +11,15 @@ public sealed record ExtractOptions(
     bool Verify = false,
     bool Raw = false,
     bool KeepRaw = false,
-    IReadOnlySet<string>? Kinds = null);
+    IReadOnlySet<string>? Kinds = null,
+    long MemoryLimit = 0);
+
+// Extraction target: whole bundle or a single sub-archive from a pack.
+public sealed record ExtractTarget(string Path, string Name, int? Archive = null)
+{
+    public static ExtractTarget WholeFile(string path) =>
+        new(path, System.IO.Path.GetFileNameWithoutExtension(path));
+}
 
 public sealed record ExtractProgress(
     int Bundles,
@@ -31,11 +39,19 @@ public static class BundleExtraction
         IEnumerable<string> bundlePaths,
         ExtractOptions options,
         IProgress<string>? log = null,
+        CancellationToken cancellationToken = default) =>
+        Run(bundlePaths.Select(ExtractTarget.WholeFile), options, log, cancellationToken);
+
+    public static ExtractProgress Run(
+        IEnumerable<ExtractTarget> targets,
+        ExtractOptions options,
+        IProgress<string>? log = null,
         CancellationToken cancellationToken = default)
     {
         var state = new RunState();
         var kinds = new ConcurrentDictionary<string, int>();
-        var paths = options.Limit > 0 ? bundlePaths.Take(options.Limit) : bundlePaths;
+        var budget = new MemoryBudget(options.MemoryLimit > 0 ? options.MemoryLimit : MemoryBudget.DefaultLimit);
+        var paths = options.Limit > 0 ? targets.Take(options.Limit) : targets;
 
         var parallelOptions = new ParallelOptions
         {
@@ -45,7 +61,7 @@ public static class BundleExtraction
 
         try
         {
-            Parallel.ForEach(paths, parallelOptions, path => ProcessOne(path, options, state, kinds, log));
+            Parallel.ForEach(paths, parallelOptions, target => ProcessOne(target, options, state, kinds, budget, log, cancellationToken));
         }
         catch (OperationCanceledException)
         {
@@ -57,21 +73,32 @@ public static class BundleExtraction
     }
 
     private static void ProcessOne(
-        string path,
+        ExtractTarget item,
         ExtractOptions options,
         RunState state,
         ConcurrentDictionary<string, int> kinds,
-        IProgress<string>? log)
+        MemoryBudget budget,
+        IProgress<string>? log,
+        CancellationToken cancellationToken)
     {
-        var name = Path.GetFileName(path);
+        var path = item.Path;
+        var name = item.Archive is { } which ? $"{Path.GetFileName(path)}#{which}" : Path.GetFileName(path);
 
         try
         {
+            var bundle = BundleReader.Read(path);
+            var archives = item.Archive is { } index
+                ? [bundle.Archives[index]]
+                : bundle.Archives;
+
+            // Archives are read one at a time, so the largest is what a worker holds at its peak.
+            var peak = archives.Count == 0 ? 0 : archives.Max(a => a.UncompressedPayloadSize);
+            using var lease = budget.Reserve(peak, cancellationToken);
+
             if (options.Verify)
             {
-                var bundle = BundleReader.Read(path);
                 using var stream = File.OpenRead(path);
-                foreach (var archive in bundle.Archives)
+                foreach (var archive in archives)
                 {
                     state.AddBytes(BundleExtractor.ReadPayload(stream, archive).Length);
                     state.AddFiles(archive.Nodes.Count);
@@ -79,8 +106,9 @@ public static class BundleExtraction
             }
             else
             {
-                var target = Path.Combine(options.OutputDirectory, Path.GetFileNameWithoutExtension(name));
-                foreach (var extracted in BundleExtractor.ExtractAll(path, target))
+                var target = Path.Combine(options.OutputDirectory, item.Name);
+                var indices = item.Archive is { } only ? [only] : Enumerable.Range(0, bundle.Archives.Count);
+                foreach (var extracted in BundleExtractor.ExtractArchives(path, bundle, target, indices))
                 {
                     state.AddFiles(1);
                     state.AddBytes(extracted.Size);

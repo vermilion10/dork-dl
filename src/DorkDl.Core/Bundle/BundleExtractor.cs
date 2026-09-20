@@ -3,17 +3,18 @@ using K4os.Compression.LZ4;
 namespace DorkDl.Core.Bundle;
 
 // Decompresses payload blocks and extracts files.
-// Note: ObfuscatedWindow is archive-relative, so block offsets must be converted before decrypting.
+// Window offset is archive-relative (restarts at each archive in multi-archive bundles).
 public static class BundleExtractor
 {
-    // Decompresses an entire archive payload into memory.
+    // Decompresses the whole payload of one archive into memory.
     public static byte[] ReadPayload(Stream stream, BundleArchive archive) =>
         ReadPayload(stream, archive, long.MaxValue);
 
-    // Decompresses payload up to `needed` bytes. Useful to grab just the CAB header and skip trailing .resS data. Allocates full buffer so offsets stay valid.
+    // Decompresses payload up to `needed` bytes (stops after reading header files, skipping trailing .resS).
+    // Buffer is sized to blocks actually decompressed so memory isn't blown on 300 MB allocations for tiny headers.
     public static byte[] ReadPayload(Stream stream, BundleArchive archive, long needed)
     {
-        var total = archive.UncompressedPayloadSize;
+        var total = BytesToDecompress(archive, needed);
         if (total > Array.MaxLength)
         {
             throw new BundleFormatException(
@@ -68,6 +69,22 @@ public static class BundleExtractor
         }
 
         return payload;
+    }
+
+    // Total payload bytes across blocks covering up to `needed` bytes.
+    public static long BytesToDecompress(BundleArchive archive, long needed)
+    {
+        var total = 0L;
+        foreach (var block in archive.Blocks)
+        {
+            total += block.UncompressedSize;
+            if (total >= needed)
+            {
+                break;
+            }
+        }
+
+        return total;
     }
 
     // Streams out clean UnityFS data (deobfuscates the 32 KB window per archive, passes the rest through).
@@ -132,15 +149,74 @@ public static class BundleExtractor
         return md5.Hash ?? throw new InvalidOperationException("MD5 produced no hash");
     }
 
-    // Extracts all files from all archives in the bundle.
-    public static IReadOnlyList<ExtractedFile> ExtractAll(string bundlePath, string outputDirectory)
+    // MD5 of each archive on its own, obfuscation undone.
+    public static IReadOnlyList<byte[]> ComputeArchivePlainHashes(string bundlePath, BundleFile bundle)
     {
-        var bundle = BundleReader.Read(bundlePath);
+        var hashes = new List<byte[]>(bundle.Archives.Count);
+        var buffer = new byte[64 * 1024];
+
+        using var source = File.OpenRead(bundlePath);
+        foreach (var archive in bundle.Archives)
+        {
+            var key = BundleKey.FromMask(archive.Mask, archive.Inverted);
+            using var md5 = System.Security.Cryptography.MD5.Create();
+
+            source.Seek(archive.ArchiveOffset, SeekOrigin.Begin);
+            var remaining = archive.ArchiveSize;
+            var position = 0L;
+            while (remaining > 0)
+            {
+                var read = source.Read(buffer, 0, (int)Math.Min(buffer.Length, remaining));
+                if (read == 0)
+                {
+                    throw new BundleFormatException($"{bundle.FileName} ends inside an archive");
+                }
+
+                var chunk = buffer.AsSpan(0, read);
+                var window = BundleObfuscation.ObfuscatedWindow - position;
+                if (window > 0)
+                {
+                    key.Decrypt(chunk[..(int)Math.Min(read, window)], position);
+                }
+
+                md5.TransformBlock(buffer, 0, read, null, 0);
+                position += read;
+                remaining -= read;
+            }
+
+            md5.TransformFinalBlock([], 0, 0);
+            hashes.Add(md5.Hash ?? throw new InvalidOperationException("MD5 produced no hash"));
+        }
+
+        return hashes;
+    }
+
+    // Extracts all files from all archives in a bundle to outputDirectory.
+    public static IReadOnlyList<ExtractedFile> ExtractAll(string bundlePath, string outputDirectory) =>
+        ExtractAll(bundlePath, BundleReader.Read(bundlePath), outputDirectory);
+
+    // Extracts a bundle whose header has already been read.
+    public static IReadOnlyList<ExtractedFile> ExtractAll(string bundlePath, BundleFile bundle, string outputDirectory) =>
+        ExtractArchives(bundlePath, bundle, outputDirectory, Enumerable.Range(0, bundle.Archives.Count));
+
+    // Extracts only the given archives of a file.
+    public static IReadOnlyList<ExtractedFile> ExtractArchives(
+        string bundlePath,
+        BundleFile bundle,
+        string outputDirectory,
+        IEnumerable<int> archiveIndices)
+    {
         var written = new List<ExtractedFile>();
 
         using var stream = File.OpenRead(bundlePath);
-        foreach (var archive in bundle.Archives)
+        foreach (var index in archiveIndices)
         {
+            if (index < 0 || index >= bundle.Archives.Count)
+            {
+                throw new BundleFormatException($"{bundle.FileName} has no archive {index}");
+            }
+
+            var archive = bundle.Archives[index];
             var payload = ReadPayload(stream, archive);
             foreach (var node in archive.Nodes)
             {

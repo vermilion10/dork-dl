@@ -11,13 +11,18 @@ public sealed record ConvertResult(
     int Skipped,
     IReadOnlyList<string> Errors);
 
-// Converts Unity serialized files to usable formats: Texture2D to PNG, sprites via SpriteSlicer, and TextAsset to raw bytes.
-// Resolves external pixel streams from sibling .resS/.resource files.
+// Converts Unity serialized files: textures to PNG, text assets to bytes, MonoBehaviours to JSON.
+// Sibling .resS files are resolved from the directory since bundle-internal archive:/ paths fail on disk.
 public static class AssetConverter
 {
+    // Subdirectory for sliced sprites.
     public const string SpriteDirectoryName = "sprites";
 
-    // Converts serialized files in sourceDirectory to outputDirectory. Optionally filters by kind (Texture2D, Sprite, TextAsset).
+    // Subdirectory for MonoBehaviour JSON dumps.
+    public const string MonoBehaviourDirectoryName = "monobehaviours";
+
+    // Converts all serialized files in sourceDirectory to outputDirectory.
+    // Filter by kinds (e.g. TextAsset) to avoid decoding unwanted textures.
     public static ConvertResult ConvertDirectory(
         string sourceDirectory,
         string outputDirectory,
@@ -69,7 +74,7 @@ public static class AssetConverter
             }
             catch (Exception e) when (e is not OutOfMemoryException)
             {
-                // Non-serialized or unreadable files are skipped.
+                // Not every file in a bundle is a serialized file; those are skipped, not fatal.
                 errors.Add($"{Path.GetFileName(path)}: {e.Message}");
             }
             finally
@@ -91,12 +96,13 @@ public static class AssetConverter
         IReadOnlySet<string>? kinds)
     {
         var typeId = (AssetClassID)info.TypeId;
-        if (typeId is not (AssetClassID.Texture2D or AssetClassID.TextAsset or AssetClassID.Sprite))
+        if (typeId is not (AssetClassID.Texture2D or AssetClassID.TextAsset or AssetClassID.Sprite
+            or AssetClassID.MonoBehaviour))
         {
             return null;
         }
 
-        // Filter by kind early before reading type trees.
+        // Checked before the base field is read, so a filtered-out asset costs nothing.
         if (kinds is not null && !kinds.Contains(typeId.ToString()))
         {
             return null;
@@ -116,6 +122,21 @@ public static class AssetConverter
 
         Directory.CreateDirectory(outputDirectory);
 
+        if (typeId == AssetClassID.MonoBehaviour)
+        {
+            // MonoBehaviours get their own folder to avoid filename collisions with scene textures/assets.
+            var monoDirectory = Path.Combine(outputDirectory, MonoBehaviourDirectoryName);
+            Directory.CreateDirectory(monoDirectory);
+
+            var monoTarget = UniquePath(monoDirectory, name, ".json");
+            using (var output = File.Create(monoTarget))
+            {
+                FieldJson.Write(output, baseField);
+            }
+
+            return new ConvertedAsset(name, monoTarget, "MonoBehaviour");
+        }
+
         if (typeId == AssetClassID.Sprite)
         {
             var cut = slicer.Cut(baseField);
@@ -124,7 +145,7 @@ public static class AssetConverter
                 return null;
             }
 
-            // Save sprites in a dedicated subfolder to avoid name collisions with parent atlas textures.
+            // Sliced sprites get their own folder to avoid colliding with parent atlas names.
             var spriteDirectory = Path.Combine(outputDirectory, SpriteDirectoryName);
             Directory.CreateDirectory(spriteDirectory);
 
@@ -166,7 +187,7 @@ public static class AssetConverter
             return new ConvertedAsset(name, target, "Texture2D");
         }
 
-        // TextAsset: m_Script often holds binary, so grab raw bytes rather than decoding as text.
+        // m_Script holds binary or text; keep raw bytes.
         var script = baseField["m_Script"];
         if (script.IsDummy)
         {
@@ -182,7 +203,7 @@ public static class AssetConverter
         return new ConvertedAsset(name, textTarget, "TextAsset");
     }
 
-    // Reads texture pixels, resolving m_StreamData to sibling .resS files on disk.
+    // Reads pixel data from sibling .resS when streamed (bypasses broken internal archive:/ paths).
     internal static byte[]? ReadPixels(TextureFile texture, AssetTypeValueField baseField, string sourceDirectory)
     {
         var streamData = baseField["m_StreamData"];
@@ -220,7 +241,7 @@ public static class AssetConverter
         return pixels;
     }
 
-    // Appends counter suffix if filename already exists.
+    // Deduplicates output filenames with suffixes if names collide.
     private static string UniquePath(string directory, string name, string extension)
     {
         var safe = string.Concat(name.Select(c => Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
@@ -234,7 +255,7 @@ public static class AssetConverter
         return candidate;
     }
 
-    private static bool LooksLikeText(byte[] bytes)
+    internal static bool LooksLikeText(byte[] bytes)
     {
         var sample = bytes.Take(512).ToArray();
         if (sample.Length == 0)

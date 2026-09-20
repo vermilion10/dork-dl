@@ -2,10 +2,11 @@ using System.Runtime.InteropServices;
 
 namespace DorkDl.Core.Catalog;
 
-// Addressables binary catalog (catalog_main_<n>.bin). Maps keys (dashed GUIDs and bundle names) to locations with download metadata (hash, CRC, size).
+// Addressables binary content catalog (catalog_main_<n>.bin).
+// Maps addressable keys (dashed GUIDs, bundle names) to locations with download metadata (hash, CRC, size).
 public sealed class ContentCatalog
 {
-    // Unity's hash of nameof(ContentCatalogData).
+    // Unity hash of nameof(ContentCatalogData).
     private const int ExpectedMagic = 0x0DE38942;
 
     private const int ExpectedVersion = 1;
@@ -83,6 +84,36 @@ public sealed class ContentCatalog
         return locations;
     }
 
+    // Returns location dependencies (e.g. which .bundle holds a typed Utage.AdvImportBook asset).
+    public IReadOnlyList<CatalogLocation> Dependencies(CatalogLocation location) =>
+        Locations(location.DependencySetOffset);
+
+    // Resolves bundle filenames an asset location loads from via its dependencies.
+    public IEnumerable<string> BundlesFor(CatalogLocation location)
+    {
+        foreach (var dependency in Dependencies(location))
+        {
+            // The internal id carries the file name as the download command knows it, the options' BundleName is the same hash without its extension.
+            var name = BundleFileName(dependency.InternalId)
+                       ?? (dependency.BundleOptions?.BundleName is { } bundle ? bundle + ".bundle" : null);
+            if (name is not null)
+            {
+                yield return name;
+            }
+        }
+    }
+
+    private static string? BundleFileName(string? internalId)
+    {
+        if (internalId is null || !internalId.EndsWith(".bundle", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var cut = internalId.LastIndexOfAny(['\\', '/']);
+        return cut < 0 ? internalId : internalId[(cut + 1)..];
+    }
+
     private CatalogLocation ReadLocation(uint offset)
     {
         var data = _reader.ReadValue<LocationData>(offset);
@@ -98,7 +129,7 @@ public sealed class ContentCatalog
                 var serialized = _reader.ReadValue<BundleOptionsData>(extra.ObjectId);
                 options = new AssetBundleRequestOptions(
                     Hash: _reader.ReadHash128(serialized.HashId),
-                    // Bundle names are dynamic strings split on '_' so Unity can reuse shared prefixes.
+                    // Bundle names are dynamic strings split on '_' to share prefix storage.
                     BundleName: _reader.ReadString(serialized.BundleNameId, '_'),
                     Crc: serialized.Crc,
                     BundleSize: serialized.BundleSize);
@@ -135,7 +166,7 @@ public sealed class ContentCatalog
         public uint LocationSetOffset;
     }
 
-    // ResourceLocation.Serializer.Data. DependencyHashValue is always zero but must be modeled to avoid offset shifts.
+    // ResourceLocation.Serializer.Data. DependencyHashValue is always 0 but occupies a slot.
     [StructLayout(LayoutKind.Sequential)]
     private struct LocationData
     {
