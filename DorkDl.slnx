@@ -1,0 +1,7 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/DorkDl.Cli/DorkDl.Cli.csproj" />
+    <Project Path="src/DorkDl.Core/DorkDl.Core.csproj" />
+    <Project Path="src/DorkDl.CriInterop/DorkDl.CriInterop.csproj" />
+  </Folder>
+</Solution>
