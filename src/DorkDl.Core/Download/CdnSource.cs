@@ -5,7 +5,7 @@ namespace DorkDl.Core.Download;
 // CDN source and version candidate resolver. Bundle URL is <base>/<version>/<md5>.bundle. Wrong version returns 403, so known version folders are probed in priority order.
 public sealed partial class CdnSource(string baseUrl, IReadOnlyList<int> versions)
 {
-    public const string DefaultBaseUrl = "https://cdn.invalid/prod/AssetBundles_Windows";
+    public static string DefaultBaseUrl => ClientValues.CdnUrl;
 
     public string BaseUrl { get; } = baseUrl.TrimEnd('/');
 

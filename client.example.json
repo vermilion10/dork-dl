@@ -1,0 +1,10 @@
+{
+  // Bundle CDN root; a bundle's URL is <root>/<version>/<md5>.bundle.
+  "cdnUrl": "",
+  // The launcher's flexible_config endpoint, which reports the current client version.
+  "launcherConfigUrl": "",
+  // The folder inside the install root that holds LocalCache and StreamingAssets, used by --game-dir.
+  "dataFolder": "",
+  // The PC HCA audio key, as a hex number, e.g. "0x0123456789ABCDEF".
+  "hcaKey": ""
+}

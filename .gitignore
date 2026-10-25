@@ -438,3 +438,6 @@ FodyWeavers.xsd
 # Python worker bytecode
 __pycache__/
 *.py[cod]
+
+# The server addresses and audio key, kept out of the repository (see client.example.json).
+client.json

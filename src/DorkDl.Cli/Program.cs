@@ -33,7 +33,7 @@ public static class Program
 
         var launcherOption = new Option<string?>("--launcher-url")
         {
-            Description = $"Launcher config endpoint, which is per-region (default: {LauncherSource.DefaultConfigUrl})",
+            Description = "Launcher config endpoint, which is per-region (default: the configured address)",
             Recursive = true,
         };
 
@@ -54,7 +54,17 @@ public static class Program
         root.Subcommands.Add(BuildNamesCommand(gameDirOption));
         root.Subcommands.Add(BuildPacksCommand(gameDirOption));
 
-        return await root.Parse(args).InvokeAsync();
+        // A missing client.json is reported as one line, not as a stack trace; anything else still goes to the
+        // default handler.
+        try
+        {
+            return await root.Parse(args).InvokeAsync(new InvocationConfiguration { EnableDefaultExceptionHandler = false });
+        }
+        catch (FileNotFoundException e) when (!ClientValues.IsConfigured)
+        {
+            Console.Error.WriteLine(e.Message);
+            return 1;
+        }
     }
 
     private static Command BuildListCommand(Option<string> gameDirOption)
@@ -914,7 +924,7 @@ public static class Program
 
         var baseUrlOption = new Option<string?>("--base-url")
         {
-            Description = $"CDN base URL (default: {CdnSource.DefaultBaseUrl})",
+            Description = "CDN base URL (default: the configured address)",
         };
 
         var command = new Command(
@@ -1050,7 +1060,7 @@ public static class Program
         var keyOption = new Option<ulong>("--key")
         {
             Description = "HCA decryption key; defaults to the configured PC key",
-            DefaultValueFactory = _ => CriWorkerClient.PcHcaKey,
+            DefaultValueFactory = _ => ClientValues.HcaKey,
         };
 
         var assetsDirOption = new Option<string?>("--assets-dir")
@@ -1311,7 +1321,7 @@ public static class Program
 
         var baseUrlOption = new Option<string?>("--base-url")
         {
-            Description = $"CDN base URL (default: {CdnSource.DefaultBaseUrl})",
+            Description = "CDN base URL (default: the configured address)",
         };
 
         var typeOption = TypeOption();

@@ -1,6 +1,6 @@
 namespace DorkDl.Core;
 
-// Locates folders in a local install (bundles and tables live under Game_Data/LocalCache/Data).
+// Locates folders in a local install (bundles and tables live under <data folder>/LocalCache/Data).
 public sealed class GameInstall
 {
     private GameInstall(string root, string dataDirectory)
@@ -94,7 +94,7 @@ public sealed class GameInstall
     public string StreamingBundleDirectory =>
         Path.Combine(DataDirectory, "StreamingAssets", "aa", "StandaloneWindows64");
 
-    // Resolves game install from either the root folder or the Game_Data directory.
+    // Resolves game install from either the root folder or its data folder (ClientValues.DataFolder).
     public static GameInstall Open(string path)
     {
         var full = Path.GetFullPath(path);
@@ -103,19 +103,19 @@ public sealed class GameInstall
             throw new DirectoryNotFoundException($"No such directory: {full}");
         }
 
-        if (Path.GetFileName(full).Equals("Game_Data", StringComparison.OrdinalIgnoreCase))
+        if (Path.GetFileName(full).Equals(ClientValues.DataFolder, StringComparison.OrdinalIgnoreCase))
         {
             return new GameInstall(Path.GetDirectoryName(full) ?? full, full);
         }
 
-        var data = Path.Combine(full, "Game_Data");
+        var data = Path.Combine(full, ClientValues.DataFolder);
         if (Directory.Exists(data))
         {
             return new GameInstall(full, data);
         }
 
         throw new DirectoryNotFoundException(
-            $"{full} does not look like a game install; expected a Game_Data directory inside it");
+            $"{full} does not look like a game install; expected a {ClientValues.DataFolder} directory inside it");
     }
 
     // Finds catalog_main_<version>.bin, choosing the highest version number if multiple are present.

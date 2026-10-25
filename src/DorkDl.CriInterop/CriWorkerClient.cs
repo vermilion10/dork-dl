@@ -7,9 +7,6 @@ namespace DorkDl.CriInterop;
 // Kept alive across calls to avoid repeated uv/PyCriCodecsEx startup costs. Serialized via lock.
 public sealed class CriWorkerClient : IDisposable
 {
-    // PC HCA key from vgmstream (0x0). Android uses a different key.
-    public const ulong PcHcaKey = 0;
-
     private readonly Process _process;
 
     // DeserializeAsync hangs on Windows live process pipes; MessagePackStreamReader frames reads properly.
@@ -57,7 +54,7 @@ public sealed class CriWorkerClient : IDisposable
         string acbPath,
         string? awbPath,
         string outputDirectory,
-        ulong key = PcHcaKey,
+        ulong key,
         CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);

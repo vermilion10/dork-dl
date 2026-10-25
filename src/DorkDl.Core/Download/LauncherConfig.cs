@@ -13,7 +13,7 @@ public sealed record LauncherConfig(
 // Note: data.flexible_config.nexon_plug is an embedded JSON string containing another JSON object with the version info.
 public static class LauncherSource
 {
-    public const string DefaultConfigUrl = "https://cdn.invalid/flexible_config";
+    public static string DefaultConfigUrl => ClientValues.LauncherConfigUrl;
 
     // Platform subfolder under CDN root.
     private const string PlatformDirectory = "AssetBundles_Windows";
