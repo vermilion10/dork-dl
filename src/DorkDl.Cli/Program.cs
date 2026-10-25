@@ -1409,8 +1409,10 @@ public static class Program
 
         if (type is null)
         {
+            // The GFF index shares the .bundle extension but holds no assets.
+            var gff = filters.Length == 0 ? install.FindGffIndex() : null;
             var byFile = install.EnumerateBundles()
-                .Where(p => Matches(Path.GetFileName(p)))
+                .Where(p => p != gff && Matches(Path.GetFileName(p)))
                 .Select(ExtractTarget.WholeFile)
                 .ToList();
 
