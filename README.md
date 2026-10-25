@@ -1,6 +1,6 @@
 # dork-dl
 
-Asset downloader and extractor for a certain Unity game. Fan-made tool for research and personal archival.
+Asset downloader and extractor for a certain Unity game. Fan-made tool for research and personal archival, not affiliated with the game's developers or publishers.
 
 End-to-end pipeline: resolves catalog bundles, mirrors from CDN with checksums/resuming, handles XOR deobfuscation and decompression, converts assets (PNGs, sliced sprites, MonoBehaviour JSON, raw text), and decodes CRI audio/video (WAV, MP4).
 
@@ -10,6 +10,10 @@ End-to-end pipeline: resolves catalog bundles, mirrors from CDN with checksums/r
 - [uv](https://docs.astral.sh/uv/) for `audio` and `video` (spawns Python worker in a cached venv automatically, no manual pip step)
 - [ffmpeg](https://ffmpeg.org/download.html) on `PATH` for `video` (muxes demuxed streams into MP4)
 - Installed game for commands reading local files (`catalog`, `download`, and `extras` can run without one via CDN)
+
+## Setup
+
+dork-dl doesn't include the game's server addresses, install folder name or audio key, and the repository contains no game assets. Before the first run, copy `client.example.json` to `%APPDATA%\dork-dl\client.json` (or next to the executable) and fill in `cdnUrl`, `launcherConfigUrl`, `dataFolder` and `hcaKey`. Without it, every command that needs one of these reports that the file is missing.
 
 ## Usage
 
@@ -57,7 +61,7 @@ dork-dl extras time_chapter_09 --output output/extras
 dork-dl download --output output/mirror
 ```
 
-- Version lookup: Unauthenticated launcher config endpoint at `https://cdn.invalid/flexible_config`. The payload is doubly encoded: `data.flexible_config.nexon_plug` is a JSON string holding another JSON object containing `ab_resource_version` (`2.7.4330.14393.27767`) and `ab_resource_addr` (CDN root).
+- Version lookup: Unauthenticated launcher config endpoint (`launcherConfigUrl` in `client.json`). The payload is doubly encoded: `data.flexible_config.nexon_plug` is a JSON string holding another JSON object containing `ab_resource_version` (`2.7.4330.14393.27767`) and `ab_resource_addr` (CDN root).
 - **The last two segments of `ab_resource_version` are the folder numbers**. Everything before is client version (e.g. `2.7.4330` can be 4 digits, so digit counts cannot distinguish them).
 - Probing older folders: The launcher only names the current build's folders, but older bundles live in older folders (e.g. `v26669`). The full version column lives in `Version.txt` on the CDN under the current folder (byte-identical to local `Version_CustomDownload.txt`).
 - Dry run test: Over a 60-bundle test, 6 were available standalone and 54 were not (28.13 MiB either way). The 54 are not missing; they live in [packs](#packs) served under the pack's name.
@@ -77,7 +81,7 @@ alongside `catalog_main_<n>.bin` and `Version_CustomDownload.txt`. Complete inst
 CDN root format:
 
 ```
-https://cdn.invalid/prod/AssetBundles_Windows/<abVersion>/<md5>.bundle
+<cdnUrl>/<abVersion>/<md5>.bundle
 ```
 
 ## The GFF index
@@ -193,7 +197,7 @@ Both inversion and XOR stop at `0x8000`. Small bundles (< 32 KiB) are fully obfu
 
 CRIWARE loose files in `LocalCache/Data/AssetBundles_Windows/Assets/ArtsResource/Audio/CriWare/*.acb, *.awb` (1,188 cue sheets, 735 streaming banks, ~7.9 GiB). Not obfuscated, readable names.
 
-- HCA key: PC key `0x0` (vgmstream database). Override with `--key` for Android.
+- HCA key: the PC key, `hcaKey` in `client.json`. Override with `--key` for Android.
 - `audio` decodes cue sheets to WAV via `tools/cri_worker` (PyCriCodecsEx via `uv`, msgpack IPC over stdio). Worker runs once per session and writes directly to disk to avoid piping gigabytes of audio through stdio.
 
 ```sh

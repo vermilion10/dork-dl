@@ -1,24 +1,62 @@
+using System.Globalization;
+using System.Text.Json;
+
 namespace DorkDl.Core;
 
-// The server addresses, install folder name and audio key the tools use.
-// Private copy: the values are hardcoded here. The public copy has the same members but reads them from client.json,
-// so tools/export-public.sh never overwrites this file.
+// The server addresses, install folder name and audio key the tools use. None of these ship with the source: they're
+// read from client.json (fields as in client.example.json), looked for next to the executable, then in the user's
+// application-data folder (dork-dl/client.json). Without the file each value throws FileNotFoundException at first
+// use, which the CLI reports as one line.
 public static class ClientValues
 {
-    public static bool IsConfigured => true;
+    public const string FileName = "client.json";
 
-    // Unused here; kept so code that reports a missing client.json in the public copy compiles unchanged.
-    public static string MissingMessage => "";
+    // Declared before Config, which reads it while the type initializes.
+    public static IReadOnlyList<string> SearchPaths { get; } =
+    [
+        Path.Combine(AppContext.BaseDirectory, FileName),
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "dork-dl", FileName),
+    ];
+
+    private static readonly ClientFile? Config = Load();
+
+    public static bool IsConfigured => Config is not null;
+
+    public static string MissingMessage =>
+        $"No {FileName} found. Copy client.example.json to {SearchPaths[^1]} and fill in the server addresses and audio key.";
 
     // Bundle CDN root; a bundle's URL is <root>/<version>/<md5>.bundle.
-    public static string CdnUrl => "https://cdn.invalid/prod/AssetBundles_Windows";
+    public static string CdnUrl => Require().CdnUrl.TrimEnd('/');
 
     // The launcher's unauthenticated flexible_config endpoint (per region).
-    public static string LauncherConfigUrl => "https://cdn.invalid/flexible_config";
+    public static string LauncherConfigUrl => Require().LauncherConfigUrl;
 
     // The folder inside the install root that holds LocalCache and StreamingAssets.
-    public static string DataFolder => "Game_Data";
+    public static string DataFolder => Require().DataFolder;
 
-    // PC HCA key from vgmstream (0x0). Android uses a different key.
-    public static ulong HcaKey => 0;
+    // The PC HCA audio key.
+    public static ulong HcaKey => ulong.Parse(Require().HcaKey.Replace("0x", "", StringComparison.OrdinalIgnoreCase),
+        NumberStyles.HexNumber, CultureInfo.InvariantCulture);
+
+    private static ClientFile Require() => Config ?? throw new FileNotFoundException(MissingMessage);
+
+    private static ClientFile? Load()
+    {
+        if (SearchPaths.FirstOrDefault(File.Exists) is not { } path)
+        {
+            return null;
+        }
+
+        try
+        {
+            var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true, ReadCommentHandling = JsonCommentHandling.Skip };
+            return JsonSerializer.Deserialize<ClientFile>(File.ReadAllText(path), options);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private sealed record ClientFile(string CdnUrl, string LauncherConfigUrl, string DataFolder, string HcaKey);
 }
