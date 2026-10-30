@@ -12,7 +12,10 @@ public sealed record GffEntry(string Name, byte[] NameHash, byte[] PlainHash);
 //   0x08: entry count (repeated 3x)
 //   0x14: count x 12-byte index table (redundant positional IDs, skipped)
 //   ...   count x 256-byte name records: [len byte] + [XORed name] + [random padding]
-//   ...   count x 4096-byte hash blocks: mostly zeros, name hash at +8, plain bundle MD5 at +32
+//   ...   count x 4096-byte hash blocks, mostly zeros, in one of two layouts:
+//         older: the bundle's name hash at +8, its plain MD5 at +32
+//         since catalog 29003: the name hash of the file holding the bundle at +0, the bundle's offset and size
+//         in that file at +16 and +20 (uint32), its plain MD5 at +24; the blocks start on a 4096-byte boundary
 public sealed class GffContainer
 {
     private static ReadOnlySpan<byte> Magic => "GFF\0"u8;
@@ -26,6 +29,7 @@ public sealed class GffContainer
     // Hash block offsets (the rest of the 4KB block is zero padding).
     private const int NameHashOffset = 8;
     private const int PlainHashOffset = 32;
+    private const int PackedPlainHashOffset = 24;
     private const int HashLength = 16;
 
     private GffContainer(IReadOnlyList<GffEntry> entries)
@@ -71,6 +75,11 @@ public sealed class GffContainer
 
         var nameBase = HeaderLength + (long)entries * IndexEntryLength;
         var hashBase = nameBase + (long)entries * NameRecordLength;
+        var aligned = (hashBase + HashBlockLength - 1) / HashBlockLength * HashBlockLength;
+        if (stream.Length >= aligned + (long)entries * HashBlockLength)
+        {
+            hashBase = aligned;
+        }
 
         var names = ReadNames(stream, nameBase, entries, key);
         var result = new List<GffEntry>(entries);
@@ -80,13 +89,35 @@ public sealed class GffContainer
         for (var i = 0; i < entries; i++)
         {
             stream.ReadExactly(block);
+            // A block holding the entry's own name hash at +8 is in the older layout.
+            var nameHash = NameHash(names[i]);
+            var older = nameHash is not null && block.AsSpan(NameHashOffset, HashLength).SequenceEqual(nameHash);
             result.Add(new GffEntry(
                 names[i],
-                block.AsSpan(NameHashOffset, HashLength).ToArray(),
-                block.AsSpan(PlainHashOffset, HashLength).ToArray()));
+                nameHash ?? block.AsSpan(NameHashOffset, HashLength).ToArray(),
+                block.AsSpan(older ? PlainHashOffset : PackedPlainHashOffset, HashLength).ToArray()));
         }
 
         return new GffContainer(result);
+    }
+
+    // The 16 bytes an MD5 bundle name spells, or null for a name that is not one.
+    private static byte[]? NameHash(string name)
+    {
+        var stem = Path.GetFileNameWithoutExtension(name);
+        if (stem.Length != HashLength * 2)
+        {
+            return null;
+        }
+
+        try
+        {
+            return Convert.FromHexString(stem);
+        }
+        catch (FormatException)
+        {
+            return null;
+        }
     }
 
     private static string[] ReadNames(Stream stream, long nameBase, int entries, byte[] key)

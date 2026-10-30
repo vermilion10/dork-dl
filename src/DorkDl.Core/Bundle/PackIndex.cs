@@ -82,7 +82,13 @@ public static class PackIndex
             }
         });
 
-        var ordered = entries.OrderBy(e => e.Name, StringComparer.Ordinal).ToList();
+        // A bundle an update moved into a pack can still have its old file on disk. The pack's copy matched the
+        // index's hash and the file was only matched by name, so the pack's copy wins.
+        var ordered = entries
+            .GroupBy(e => e.Name, StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.OrderBy(e => e.File.Equals(e.Name, StringComparison.OrdinalIgnoreCase)).First())
+            .OrderBy(e => e.Name, StringComparer.Ordinal)
+            .ToList();
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(outputPath))!);
         using (var stream = File.Create(outputPath))
         {
