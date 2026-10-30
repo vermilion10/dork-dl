@@ -108,7 +108,8 @@ public static class BundleExtraction
             {
                 var target = Path.Combine(options.OutputDirectory, item.Name);
                 var indices = item.Archive is { } only ? [only] : Enumerable.Range(0, bundle.Archives.Count);
-                foreach (var extracted in BundleExtractor.ExtractArchives(path, bundle, target, indices))
+                var files = BundleExtractor.ExtractArchives(path, bundle, target, indices);
+                foreach (var extracted in files)
                 {
                     state.AddFiles(1);
                     state.AddBytes(extracted.Size);
@@ -116,7 +117,8 @@ public static class BundleExtraction
 
                 if (!options.Raw)
                 {
-                    var result = AssetConverter.ConvertDirectory(target, target, options.Kinds);
+                    // Only what this bundle just unpacked: the folder also holds earlier runs' converted assets.
+                    var result = AssetConverter.ConvertFiles(files.Select(f => f.Path), target, target, options.Kinds);
                     foreach (var asset in result.Assets)
                     {
                         state.AddConverted(1);

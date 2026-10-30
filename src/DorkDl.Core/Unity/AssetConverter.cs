@@ -26,16 +26,28 @@ public static class AssetConverter
     public static ConvertResult ConvertDirectory(
         string sourceDirectory,
         string outputDirectory,
+        IReadOnlySet<string>? kinds = null) =>
+        ConvertFiles(Directory.GetFiles(sourceDirectory), sourceDirectory, outputDirectory, kinds);
+
+    // Converts the given files, which sit in sourceDirectory with their .resS files.
+    // Listing the files up front matters when the output goes to the same directory: converted text assets
+    // read back as serialized files can claim billions of entries, and each claim is allocated.
+    public static ConvertResult ConvertFiles(
+        IEnumerable<string> files,
+        string sourceDirectory,
+        string outputDirectory,
         IReadOnlySet<string>? kinds = null)
     {
         var assets = new List<ConvertedAsset>();
         var errors = new List<string>();
         var skipped = 0;
+        var claimed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        var candidates = Directory.EnumerateFiles(sourceDirectory)
+        var candidates = files
             .Where(p => !p.EndsWith(".resS", StringComparison.OrdinalIgnoreCase)
                         && !p.EndsWith(".resource", StringComparison.OrdinalIgnoreCase))
-            .Order(StringComparer.Ordinal);
+            .Order(StringComparer.Ordinal)
+            .ToList();
 
         foreach (var path in candidates)
         {
@@ -56,7 +68,7 @@ public static class AssetConverter
                     try
                     {
                         var converted = ConvertOne(
-                            manager, instance, info, slicer, sourceDirectory, outputDirectory, kinds);
+                            manager, instance, info, slicer, sourceDirectory, outputDirectory, kinds, claimed);
                         if (converted is null)
                         {
                             skipped++;
@@ -93,7 +105,8 @@ public static class AssetConverter
         SpriteSlicer slicer,
         string sourceDirectory,
         string outputDirectory,
-        IReadOnlySet<string>? kinds)
+        IReadOnlySet<string>? kinds,
+        HashSet<string> claimed)
     {
         var typeId = (AssetClassID)info.TypeId;
         if (typeId is not (AssetClassID.Texture2D or AssetClassID.TextAsset or AssetClassID.Sprite
@@ -128,7 +141,7 @@ public static class AssetConverter
             var monoDirectory = Path.Combine(outputDirectory, MonoBehaviourDirectoryName);
             Directory.CreateDirectory(monoDirectory);
 
-            var monoTarget = UniquePath(monoDirectory, name, ".json");
+            var monoTarget = UniquePath(claimed, monoDirectory, name, ".json");
             using (var output = File.Create(monoTarget))
             {
                 FieldJson.Write(output, baseField);
@@ -149,7 +162,7 @@ public static class AssetConverter
             var spriteDirectory = Path.Combine(outputDirectory, SpriteDirectoryName);
             Directory.CreateDirectory(spriteDirectory);
 
-            var spriteTarget = UniquePath(spriteDirectory, name, ".png");
+            var spriteTarget = UniquePath(claimed, spriteDirectory, name, ".png");
             using (var output = File.Create(spriteTarget))
             {
                 new StbImageWriteSharp.ImageWriter().WritePng(
@@ -177,7 +190,7 @@ public static class AssetConverter
                 return null;
             }
 
-            var target = UniquePath(outputDirectory, name, ".png");
+            var target = UniquePath(claimed, outputDirectory, name, ".png");
             if (!texture.DecodeTextureImage(pixels, target, ImageExportType.Png, 100))
             {
                 throw new InvalidOperationException(
@@ -198,7 +211,7 @@ public static class AssetConverter
             ? script.AsByteArray
             : System.Text.Encoding.UTF8.GetBytes(script.AsString ?? string.Empty);
 
-        var textTarget = UniquePath(outputDirectory, name, LooksLikeText(bytes) ? ".txt" : ".bytes");
+        var textTarget = UniquePath(claimed, outputDirectory, name, LooksLikeText(bytes) ? ".txt" : ".bytes");
         File.WriteAllBytes(textTarget, bytes);
         return new ConvertedAsset(name, textTarget, "TextAsset");
     }
@@ -241,13 +254,14 @@ public static class AssetConverter
         return pixels;
     }
 
-    // Deduplicates output filenames with suffixes if names collide.
-    private static string UniquePath(string directory, string name, string extension)
+    // Suffixes a name taken by another asset of this conversion. A file left by an earlier run is overwritten,
+    // so extracting again into the same folder updates the assets instead of adding numbered copies.
+    private static string UniquePath(HashSet<string> claimed, string directory, string name, string extension)
     {
         var safe = string.Concat(name.Select(c => Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
         var candidate = Path.Combine(directory, safe + extension);
         var counter = 1;
-        while (File.Exists(candidate))
+        while (!claimed.Add(candidate))
         {
             candidate = Path.Combine(directory, $"{safe}_{counter++}{extension}");
         }
