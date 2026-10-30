@@ -683,18 +683,22 @@ public static class Program
             if (rebuild || !File.Exists(index))
             {
                 // The GFF index sits in the bundle directory with a .bundle name, and is not one.
+                // With pack index, record entries under catalog bundle names instead of "<pack>#<i>".
+                var packs = LoadOrBuildPacks(
+                    install, parse.GetValue(packsOption)!, parse.GetValue(concurrencyOption), rebuild: false, cancellationToken);
+                var byArchive = packs.Values.ToDictionary(e => (e.File, e.Archive), e => e.Name);
+
+                // The GFF index sits in the bundle directory with a .bundle name, and is not one. A file the pack
+                // index does not use is left out: an update can move a bundle into a pack and leave its old file,
+                // which would otherwise be indexed under the bundle's name with its old contents.
                 var gff = install.FindGffIndex();
-                var sources = install.EnumerateBundles().Where(p => p != gff);
+                var used = packs.Values.Select(e => e.File).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                var sources = install.EnumerateBundles().Where(p => p != gff && used.Contains(Path.GetFileName(p)));
                 var take = parse.GetValue(bundlesOption);
                 if (take > 0)
                 {
                     sources = sources.Take(take);
                 }
-
-                // With pack index, record entries under catalog bundle names instead of "<pack>#<i>".
-                var packs = LoadOrBuildPacks(
-                    install, parse.GetValue(packsOption)!, parse.GetValue(concurrencyOption), rebuild: false, cancellationToken);
-                var byArchive = packs.Values.ToDictionary(e => (e.File, e.Archive), e => e.Name);
                 string NameArchive(string file, int archive) =>
                     byArchive.TryGetValue((file, archive), out var name) ? name : archive == 0 ? file : $"{file}#{archive}";
 
